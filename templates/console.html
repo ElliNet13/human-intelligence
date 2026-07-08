@@ -161,6 +161,58 @@
   }
   #error-btn:hover{ border-color:var(--red); }
   #status-msg{ font-size:12px; color:var(--muted); }
+
+  /* ---- reply FAB + bottom-sheet responder (mobile) ---- */
+  #back-btn{
+    display:none; background:none; border:none; color:var(--text); cursor:pointer;
+    font-size:18px; padding:4px 6px 4px 0; line-height:1; flex-shrink:0;
+  }
+  #responder-head{ display:none; align-items:center; margin-bottom:8px; }
+  #responder-head .label{ margin-bottom:0; }
+  #responder-close{
+    margin-left:auto; background:none; border:none; color:var(--muted); font-size:20px;
+    line-height:1; cursor:pointer; padding:2px 6px;
+  }
+  #reply-fab{
+    display:none; position:fixed; right:18px; bottom:18px; z-index:30;
+    background:var(--amber); color:#1c1406; border:none; border-radius:999px;
+    padding:13px 22px; font-size:14px; font-weight:700; cursor:pointer;
+    box-shadow:0 6px 18px rgba(0,0,0,.35); align-items:center; gap:8px;
+  }
+  #reply-fab .fab-dot{ width:7px; height:7px; border-radius:50%; background:#1c1406; opacity:.55; }
+
+  /* ---- mobile layout ---- */
+  @media (max-width: 760px){
+    body{ overflow:hidden; }
+    #queue{
+      position:fixed; inset:0; z-index:20; width:100%;
+      transition: transform .22s ease;
+    }
+    #queue.hide-mobile{ transform: translateX(-100%); }
+    #main{
+      position:fixed; inset:0; z-index:10;
+    }
+    #placeholder{ display:none !important; }
+    #job-header{ padding:12px 14px; gap:10px; }
+    #back-btn{ display:block; }
+    #tools-toggle{ padding:6px 10px; }
+    #thread{ padding:14px 14px 90px; }
+    .system-block{ padding:10px 12px; }
+
+    #responder{
+      position:fixed; left:0; right:0; bottom:0; z-index:25;
+      border-radius:16px 16px 0 0; padding:14px 16px calc(16px + env(safe-area-inset-bottom));
+      box-shadow: 0 -8px 24px rgba(0,0,0,.4);
+      transform: translateY(100%);
+      transition: transform .22s ease;
+      max-height:80vh; overflow-y:auto;
+    }
+    #responder.open{ transform: translateY(0); }
+    #responder-head{ display:flex; }
+    #reply-fab{ display:flex; }
+    #reply-fab.hide{ display:none; }
+    #actions-row{ flex-wrap:wrap; }
+  }
 </style>
 </head>
 <body>
@@ -177,6 +229,7 @@
     <div id="placeholder">Pick a request on the left to see the full conversation, tools, and reply as the model.</div>
     <div id="job-view">
       <div id="job-header">
+        <button id="back-btn" type="button" aria-label="Back to queue">&#8592;</button>
         <div>
           <div class="model mono" id="jh-model"></div>
           <div class="meta" id="jh-meta"></div>
@@ -186,8 +239,12 @@
       </div>
       <div id="tools-panel"></div>
       <div id="thread"></div>
+      <button id="reply-fab" type="button"><span class="fab-dot"></span>Reply</button>
       <div id="responder">
-        <div class="label">Reply as the model</div>
+        <div id="responder-head">
+          <div class="label">Reply as the model</div>
+          <button id="responder-close" type="button" aria-label="Close">&times;</button>
+        </div>
         <textarea id="reply-text" placeholder="Write the assistant's text reply here (optional if you're only calling a tool)&hellip;"></textarea>
         <div id="tool-calls-editor"></div>
         <button id="add-tool-call-btn" type="button">+ Add tool call</button>
@@ -217,6 +274,22 @@ const addToolCallBtn = document.getElementById('add-tool-call-btn');
 const sendBtn = document.getElementById('send-btn');
 const errorBtn = document.getElementById('error-btn');
 const statusMsg = document.getElementById('status-msg');
+const backBtn = document.getElementById('back-btn');
+const replyFab = document.getElementById('reply-fab');
+const responderEl = document.getElementById('responder');
+const responderClose = document.getElementById('responder-close');
+const queueEl = document.getElementById('queue');
+
+const isMobile = () => window.matchMedia('(max-width: 760px)').matches;
+
+function openResponder(){
+  responderEl.classList.add('open');
+  replyFab.classList.add('hide');
+}
+function closeResponder(){
+  responderEl.classList.remove('open');
+  replyFab.classList.remove('hide');
+}
 
 let pending = [];
 let activeJob = null;   // full job detail currently shown
@@ -273,6 +346,8 @@ function resetView(){
   activeJob = null;
   jobViewEl.style.display = 'none';
   placeholderEl.style.display = 'flex';
+  closeResponder();
+  if (isMobile()) queueEl.classList.remove('hide-mobile');
 }
 
 async function openJob(id){
@@ -283,8 +358,14 @@ async function openJob(id){
   renderJob();
   placeholderEl.style.display = 'none';
   jobViewEl.style.display = 'flex';
+  closeResponder();
+  if (isMobile()) queueEl.classList.add('hide-mobile');
   refreshQueue();
 }
+
+backBtn.addEventListener('click', resetView);
+replyFab.addEventListener('click', openResponder);
+responderClose.addEventListener('click', closeResponder);
 
 function renderJob(){
   const j = activeJob;
@@ -421,6 +502,14 @@ errorBtn.addEventListener('click', async () => {
   sendBtn.click();
 });
 
+window.addEventListener('resize', () => {
+  if (!isMobile()){
+    queueEl.classList.remove('hide-mobile');
+  } else if (activeId){
+    queueEl.classList.add('hide-mobile');
+  }
+});
+
 setInterval(refreshQueue, 1500);
 setInterval(() => {
   document.querySelectorAll('.waiting[data-created]').forEach(el => {
@@ -431,3 +520,4 @@ refreshQueue();
 </script>
 </body>
 </html>
+
