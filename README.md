@@ -36,6 +36,10 @@ It listens on `0.0.0.0:8787`. The operator UI has no login, so keep the port off
 | array of strings/numbers | list (one per line), json |
 | object / other | json |
 
+## Live updates
+
+The UI opens one WebSocket (`/ws`) and the server pushes every change: new requests, status changes, tool controls as they finish generating, removals and settings. Nothing polls. On a dropped connection the UI shows "reconnecting…", retries with backoff, and resyncs from a fresh snapshot, so requests that arrived while it was offline still appear. Browsers don't apply CORS to WebSockets, so the server only accepts connections from pages served by itself; if you reach the UI through a proxy that changes the Host header, list the page's origin in `ALLOWED_ORIGINS`.
+
 ## Configuration
 
 `.env` (see `.env.example`):
@@ -49,6 +53,7 @@ It listens on `0.0.0.0:8787`. The operator UI has no login, so keep the port off
 | `HOST` | `0.0.0.0` | Listen address |
 | `API_KEY` | empty | If set, clients must send `Authorization: Bearer <key>` to `/v1/*` |
 | `DATA_DIR` | `./data` | Where settings and the control cache are stored |
+| `ALLOWED_ORIGINS` | empty | Extra page origins allowed to open the UI WebSocket, comma separated |
 
 The gear icon in the UI changes the AI model, and optionally a separate model for reading tools (blank means the same model). These are saved in `data/settings.json`. When forwarding, the client's model name is replaced by the AI model; clear the field to pass the client's name through.
 

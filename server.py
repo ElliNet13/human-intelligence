@@ -11,6 +11,7 @@ controls so tool calls can be built without reading the raw schemas.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -22,10 +23,11 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeGuard, cast
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -67,6 +69,8 @@ CACHE_FILE = DATA_DIR / "controls_cache.json"
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8787"))
 API_KEY = os.environ.get("API_KEY", "")
+# Extra browser origins allowed to open the operator WebSocket (comma separated), e.g. https://llm.example.com
+ALLOWED_ORIGINS = {o.strip().lower() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()}
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "").strip()
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
@@ -74,6 +78,7 @@ DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "").strip() or "mimo_v2.6:latest"
 
 MAX_HISTORY = 100
 KEEPALIVE_SECONDS = 15.0
+HUB_QUEUE_LIMIT = 500
 CONTROLS_BATCH = 6
 UPSTREAM_TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 
@@ -549,12 +554,71 @@ class PendingRequest:
     answer: dict[str, Any] | None = None
     controls_state: str = "ready"  # working|ready
     controls_error: str = ""
+    controls_version: int = 0
     controls: list[dict[str, Any]] = field(default_factory=lambda: [])
     controls_task: asyncio.Task[None] | None = None
 
 
 REQUESTS: dict[str, PendingRequest] = {}
 ACTIVE_STATUSES = ("pending", "forwarding")
+
+
+class Hub:
+    """Fans server events out to every connected operator UI, so the UI never has to poll."""
+
+    def __init__(self) -> None:
+        self.clients: set[asyncio.Queue[str | None]] = set()
+
+    def subscribe(self) -> asyncio.Queue[str | None]:
+        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=HUB_QUEUE_LIMIT)
+        self.clients.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[str | None]) -> None:
+        self.clients.discard(queue)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        if not self.clients:
+            return
+        text = json.dumps(event, ensure_ascii=False)
+        for queue in list(self.clients):
+            try:
+                queue.put_nowait(text)
+            except asyncio.QueueFull:
+                # A stalled client: drop its backlog and tell it to reconnect, which resyncs it from a fresh snapshot.
+                self.clients.discard(queue)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(None)
+
+
+HUB = Hub()
+
+
+def publish_request(pr: PendingRequest) -> None:
+    HUB.publish({"type": "request", "request": summarize(pr)})
+
+
+def controls_payload(pr: PendingRequest) -> dict[str, Any]:
+    return {
+        "id": pr.id,
+        "version": pr.controls_version,
+        "state": pr.controls_state,
+        "error": pr.controls_error,
+        "controls": pr.controls,
+    }
+
+
+def bump_controls(pr: PendingRequest) -> None:
+    """Call after any change to a request's controls; the version lets the UI ignore out-of-order copies."""
+    pr.controls_version += 1
+    HUB.publish({"type": "controls", **controls_payload(pr)})
+
+
+def cancel_request(pr: PendingRequest) -> None:
+    if pr.status in ACTIVE_STATUSES:
+        pr.status = "cancelled"
+        publish_request(pr)
 
 
 def controls_model_for(pr: PendingRequest) -> str:
@@ -583,6 +647,7 @@ async def prepare_controls(pr: PendingRequest, force: bool = False) -> None:
                     CONTROLS_CACHE[tool_key(tool)] = build_spec(tool, hint)
                     changed = True
                 pr.controls = provisional_controls(tools)
+                bump_controls(pr)
             if changed:
                 save_cache()
     except Exception as exc:  # noqa: BLE001
@@ -590,6 +655,7 @@ async def prepare_controls(pr: PendingRequest, force: bool = False) -> None:
     pr.controls = provisional_controls(tools)
     pr.controls_error = short("; ".join(dict.fromkeys(errors)), 400)
     pr.controls_state = "ready"
+    bump_controls(pr)
 
 
 def prune() -> None:
@@ -597,8 +663,11 @@ def prune() -> None:
     if excess <= 0:
         return
     finished = [rid for rid, pr in REQUESTS.items() if pr.status not in ACTIVE_STATUSES]
-    for rid in finished[:excess]:
+    removed = finished[:excess]
+    for rid in removed:
         del REQUESTS[rid]
+    if removed:
+        HUB.publish({"type": "removed", "ids": removed})
 
 
 def create_request(body: dict[str, Any], generate_controls: bool) -> PendingRequest:
@@ -617,6 +686,7 @@ def create_request(body: dict[str, Any], generate_controls: bool) -> PendingRequ
         pr.controls_task = asyncio.create_task(prepare_controls(pr))
     REQUESTS[pr.id] = pr
     prune()
+    publish_request(pr)
     log.info(
         "request %s: model=%s messages=%d tools=%d stream=%s",
         pr.id,
@@ -635,18 +705,22 @@ def get_request(request_id: str) -> PendingRequest:
     return pr
 
 
-def resolve(pr: PendingRequest, decision: Decision) -> None:
+def resolve(pr: PendingRequest, decision: Decision, answer: dict[str, Any] | None = None) -> None:
     if pr.status != "pending" or pr.future.done():
         raise HTTPException(409, "This request is no longer waiting for an answer")
     pr.status = {"forward": "forwarding", "manual": "answered", "error": "rejected"}[decision.kind]
     if decision.kind == "error":
         pr.error = decision.error
+    if answer is not None:
+        pr.answer = answer
     pr.future.set_result(decision)
+    publish_request(pr)
 
 
 def fail(pr: PendingRequest, message: str) -> None:
     pr.status = "error"
     pr.error = message
+    publish_request(pr)
     log.warning("request %s failed: %s", pr.id, message)
 
 
@@ -831,6 +905,7 @@ async def forward_json(pr: PendingRequest) -> Response:
     first = as_dict(choices[0]) if choices else {}
     pr.answer = answer_from_message(as_dict(first.get("message")))
     pr.status = "forwarded"
+    publish_request(pr)
     return JSONResponse(data)
 
 
@@ -859,6 +934,7 @@ async def forward_stream(pr: PendingRequest) -> AsyncIterator[str]:
         return
     pr.answer = accumulator.answer()
     pr.status = "forwarded"
+    publish_request(pr)
 
 
 # --------------------------------------------------------------------------
@@ -913,14 +989,10 @@ async def list_models(request: Request) -> Response:
     denied = check_auth(request)
     if denied:
         return denied
-    names = ["human"]
-    if SETTINGS.forward_model:
-        names.append(SETTINGS.forward_model)
-    created = int(time.time())
     return JSONResponse(
         {
             "object": "list",
-            "data": [{"id": n, "object": "model", "created": created, "owned_by": "human-llm"} for n in names],
+            "data": [{"id": "human", "object": "model", "created": int(time.time()), "owned_by": "human-llm"}],
         }
     )
 
@@ -937,7 +1009,7 @@ async def json_flow(request: Request, pr: PendingRequest) -> Response:
     try:
         decision = await wait_for_decision(request, pr)
         if decision is None:
-            pr.status = "cancelled"
+            cancel_request(pr)
             return Response(status_code=499)
         if decision.kind == "forward":
             return await forward_json(pr)
@@ -945,8 +1017,7 @@ async def json_flow(request: Request, pr: PendingRequest) -> Response:
             return error_response(500, decision.error or "The operator declined this request")
         return JSONResponse(manual_completion(pr, decision))
     except asyncio.CancelledError:
-        if pr.status in ACTIVE_STATUSES:
-            pr.status = "cancelled"
+        cancel_request(pr)
         raise
 
 
@@ -958,7 +1029,7 @@ async def stream_flow(request: Request, pr: PendingRequest) -> AsyncIterator[str
             if pr.future.done():
                 break
             if await request.is_disconnected():
-                pr.status = "cancelled"
+                cancel_request(pr)
                 return
             if time.monotonic() - last_ping >= KEEPALIVE_SECONDS:
                 last_ping = time.monotonic()
@@ -974,8 +1045,7 @@ async def stream_flow(request: Request, pr: PendingRequest) -> AsyncIterator[str
             async for piece in forward_stream(pr):
                 yield piece
     except asyncio.CancelledError:
-        if pr.status in ACTIVE_STATUSES:
-            pr.status = "cancelled"
+        cancel_request(pr)
         raise
 
 
@@ -1071,6 +1141,8 @@ async def api_clear_requests() -> dict[str, int]:
     finished = [rid for rid, pr in REQUESTS.items() if pr.status not in ACTIVE_STATUSES]
     for rid in finished:
         del REQUESTS[rid]
+    if finished:
+        HUB.publish({"type": "removed", "ids": finished})
     return {"removed": len(finished)}
 
 
@@ -1091,7 +1163,7 @@ async def api_get_request(request_id: str) -> dict[str, Any]:
 @app.get("/api/requests/{request_id}/controls")
 async def api_get_controls(request_id: str) -> dict[str, Any]:
     pr = get_request(request_id)
-    return {"state": pr.controls_state, "error": pr.controls_error, "controls": pr.controls}
+    return controls_payload(pr)
 
 
 @app.post("/api/requests/{request_id}/controls/regenerate")
@@ -1101,6 +1173,7 @@ async def api_regenerate_controls(request_id: str) -> dict[str, str]:
         raise HTTPException(409, "Controls are already being generated")
     pr.controls_state = "working"
     pr.controls_error = ""
+    bump_controls(pr)
     pr.controls_task = asyncio.create_task(prepare_controls(pr, force=True))
     return {"state": pr.controls_state}
 
@@ -1141,8 +1214,7 @@ async def api_respond(request_id: str, payload: RespondIn) -> dict[str, str]:
     if not payload.content.strip() and not calls:
         raise HTTPException(422, "Write a message or add at least one tool call")
     decision = Decision("manual", content=payload.content, tool_calls=calls)
-    resolve(pr, decision)
-    pr.answer = answer_from_message(build_message(decision))
+    resolve(pr, decision, answer_from_message(build_message(decision)))
     return {"status": pr.status}
 
 
@@ -1191,7 +1263,65 @@ async def api_set_settings(payload: SettingsIn) -> dict[str, Any]:
     if payload.auto_forward is not None:
         SETTINGS.auto_forward = payload.auto_forward
     save_settings()
+    HUB.publish({"type": "settings", "settings": settings_view()})
     return settings_view()
+
+
+# --------------------------------------------------------------------------
+# Live updates for the operator UI
+# --------------------------------------------------------------------------
+
+
+def origin_allowed(ws: WebSocket) -> bool:
+    """Browsers don't apply CORS to WebSockets, so refuse pages from other sites reading the queue."""
+    origin = ws.headers.get("origin")
+    if not origin or origin.lower() in ALLOWED_ORIGINS:
+        return True
+    return urlsplit(origin).netloc.lower() == ws.headers.get("host", "").lower()
+
+
+async def ws_pump(ws: WebSocket, queue: asyncio.Queue[str | None]) -> None:
+    while True:
+        item = await queue.get()
+        if item is None:
+            await ws.close(code=1013)  # backlog overflowed; the client reconnects and resyncs
+            return
+        await ws.send_text(item)
+
+
+async def ws_watch(ws: WebSocket) -> None:
+    while True:
+        message = await ws.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket) -> None:
+    if not origin_allowed(ws):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    queue = HUB.subscribe()  # subscribe before the snapshot so nothing that happens in between is lost
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        hello = {
+            "type": "hello",
+            "requests": [summarize(pr) for pr in REQUESTS.values()],
+            "settings": settings_view(),
+        }
+        await ws.send_text(json.dumps(hello, ensure_ascii=False))
+        tasks = [asyncio.create_task(ws_pump(ws, queue)), asyncio.create_task(ws_watch(ws))]
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    except Exception:  # noqa: BLE001 - a dropped connection is routine
+        pass
+    finally:
+        HUB.unsubscribe(queue)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 # --------------------------------------------------------------------------

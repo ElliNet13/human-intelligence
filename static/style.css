@@ -71,6 +71,11 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
   border-bottom: 1px solid var(--border);
 }
 
+.side-title { display: flex; align-items: center; gap: 10px; }
+.conn { font-size: 11.5px; font-weight: 600; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+.conn.live { color: var(--ok); border-color: var(--ok); }
+.conn.down { color: var(--danger); border-color: var(--danger); }
+
 .side-options {
   display: flex;
   flex-direction: column;

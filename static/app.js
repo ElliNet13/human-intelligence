@@ -1,7 +1,5 @@
 "use strict";
 
-const POLL_MS = 1000;
-
 const STATUS_LABELS = {
   pending: "Waiting for you",
   forwarding: "AI working…",
@@ -26,11 +24,9 @@ const state = {
 const drafts = new Map();
 // Handles to live parts of the composer, filled in by renderComposer().
 const ui = {};
-let controlsEpoch = 0;
 let audioCtx = null;
 
 const $ = (selector) => document.querySelector(selector);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------- helpers
 
@@ -126,6 +122,132 @@ function draftFor(id) {
   return draft;
 }
 
+// ----------------------------------------------------------- live updates
+// One WebSocket carries everything the server pushes, so the page never polls.
+
+let socket = null;
+let retryMs = 500;
+let retryTimer = null;
+
+function setConnection(kind) {
+  const el = $("#conn");
+  el.className = `conn ${kind}`;
+  el.textContent = kind === "live" ? "live" : kind === "down" ? "reconnecting…" : "connecting…";
+  el.title = kind === "live" ? "Connected: updates arrive instantly" : "No connection to the server; retrying";
+}
+
+function connect() {
+  clearTimeout(retryTimer);
+  setConnection("connecting");
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${scheme}//${location.host}/ws`);
+  socket = ws;
+  ws.addEventListener("open", () => {
+    retryMs = 500;
+    setConnection("live");
+  });
+  ws.addEventListener("message", (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    handleEvent(msg);
+  });
+  ws.addEventListener("close", () => {
+    if (socket !== ws) return;
+    setConnection("down");
+    retryTimer = setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 10000);
+  });
+  ws.addEventListener("error", () => {
+    try { ws.close(); } catch { /* already closing */ }
+  });
+}
+
+function handleEvent(msg) {
+  switch (msg.type) {
+    case "hello": return onHello(msg);
+    case "request": return onRequest(msg.request);
+    case "removed": return onRemoved(msg.ids);
+    case "controls": return onControls(msg);
+    case "settings": return applySettings(msg.settings);
+  }
+}
+
+function announceNew(summaries) {
+  let announce = false;
+  for (const r of summaries) {
+    if (!state.seen.has(r.id)) {
+      state.seen.add(r.id);
+      if (r.status === "pending") announce = true;
+    }
+  }
+  if (announce && $("#sound").checked) beep();
+}
+
+function clearSelection() {
+  state.selectedId = null;
+  state.detail = null;
+  state.controls = null;
+  renderDetail();
+}
+
+function autoSelect() {
+  const first = sortedRequests()[0];
+  if (first) select(first.id);
+}
+
+// Sent on every (re)connect: the full queue, so nothing missed while offline stays missed.
+function onHello(msg) {
+  state.requests = msg.requests;
+  applySettings(msg.settings);
+  if (state.seen === null) state.seen = new Set(msg.requests.map((r) => r.id));
+  else announceNew(msg.requests);
+  if (state.selectedId && !state.requests.some((r) => r.id === state.selectedId)) clearSelection();
+  renderQueue();
+  if (!state.selectedId) {
+    autoSelect();
+    return;
+  }
+  const current = state.requests.find((r) => r.id === state.selectedId);
+  if (!state.detail || state.detail.status !== current.status) loadDetail(current.id);
+  else if (current.status === "pending" && state.detail.tool_names.length) fetchControls(current.id);
+}
+
+function onRequest(summary) {
+  const index = state.requests.findIndex((r) => r.id === summary.id);
+  if (index === -1) state.requests.push(summary);
+  else state.requests[index] = summary;
+  announceNew([summary]);
+  if (!state.selectedId) {
+    autoSelect();
+    return;
+  }
+  renderQueue();
+  if (summary.id === state.selectedId && state.detail && state.detail.status !== summary.status) loadDetail(summary.id);
+}
+
+function onRemoved(ids) {
+  const gone = new Set(ids);
+  state.requests = state.requests.filter((r) => !gone.has(r.id));
+  if (gone.has(state.selectedId)) clearSelection();
+  renderQueue();
+  if (!state.selectedId) autoSelect();
+}
+
+function onControls(controls) {
+  if (controls.id !== state.selectedId) return;
+  if (state.controls && controls.version < state.controls.version) return; // an older copy arrived late
+  state.controls = controls;
+  renderControls();
+}
+
+function applySettings(settings) {
+  if (settings) $("#auto-forward").checked = settings.auto_forward;
+}
+
 // ------------------------------------------------------------------ queue
 
 function sortedRequests() {
@@ -161,45 +283,6 @@ function renderQueue() {
   document.title = waiting ? `(${waiting}) Human LLM` : "Human LLM";
 }
 
-async function refreshList() {
-  let list;
-  try {
-    list = await api.get("/api/requests");
-  } catch {
-    return;
-  }
-  state.requests = list;
-
-  if (state.seen === null) {
-    state.seen = new Set(list.map((r) => r.id));
-  } else {
-    let announce = false;
-    for (const r of list) {
-      if (!state.seen.has(r.id)) {
-        state.seen.add(r.id);
-        if (r.status === "pending") announce = true;
-      }
-    }
-    if (announce && $("#sound").checked) beep();
-  }
-
-  if (state.selectedId && !list.some((r) => r.id === state.selectedId)) {
-    state.selectedId = null;
-    state.detail = null;
-    renderDetail();
-  }
-  if (!state.selectedId && list.length) {
-    await select(sortedRequests()[0].id);
-    return;
-  }
-  renderQueue();
-
-  const current = list.find((r) => r.id === state.selectedId);
-  if (current && state.detail && state.detail.id === current.id && state.detail.status !== current.status) {
-    await loadDetail(current.id);
-  }
-}
-
 async function select(id) {
   state.selectedId = id;
   state.detail = null;
@@ -209,19 +292,22 @@ async function select(id) {
   await loadDetail(id);
 }
 
-async function loadDetail(id) {
+async function loadDetail(id, attempt = 0) {
   let detail;
   try {
     detail = await api.get(`/api/requests/${id}`);
   } catch (err) {
-    toast(err.message);
+    if (state.selectedId === id) toast(err.message);
     return;
   }
   if (state.selectedId !== id) return;
   state.detail = detail;
   renderQueue();
   renderDetail();
-  if (detail.status === "pending" && detail.tool_names.length) loadControls(id);
+  if (detail.status === "pending" && detail.tool_names.length) fetchControls(id);
+  // A push may have announced a newer status while this response was in flight.
+  const latest = state.requests.find((r) => r.id === id);
+  if (latest && latest.status !== detail.status && attempt < 3) await loadDetail(id, attempt + 1);
 }
 
 // ----------------------------------------------------------------- detail
@@ -371,7 +457,7 @@ function renderComposer(d) {
       h("div", { class: "tools-head" },
         h("h3", { class: "grow" }, `Tools (${d.tool_names.length})`),
         ui.controlsStatus,
-        h("button", { class: "btn small", type: "button", onclick: () => loadControls(d.id, true) }, "Re-read tools")),
+        h("button", { class: "btn small", type: "button", onclick: () => regenerateControls(d.id) }, "Re-read tools")),
       d.tool_names.length > 6 ? filter : null,
       ui.controlsBox,
       customCallCard(d, draft));
@@ -421,32 +507,22 @@ function controlsStatusText(c) {
   return { text: "Controls ready", cls: "" };
 }
 
-async function loadControls(id, regenerate = false) {
-  const epoch = ++controlsEpoch;
-  if (regenerate) {
-    try {
-      await api.post(`/api/requests/${id}/controls/regenerate`);
-    } catch (err) {
-      toast(err.message);
-      return;
-    }
+// One fetch when a request is opened; after that the server pushes every change.
+async function fetchControls(id) {
+  let controls;
+  try {
+    controls = await api.get(`/api/requests/${id}/controls`);
+  } catch {
+    return;
   }
-  let failures = 0;
-  for (;;) {
-    let controls;
-    try {
-      controls = await api.get(`/api/requests/${id}/controls`);
-      failures = 0;
-    } catch {
-      if (++failures >= 3) return;
-      await sleep(1500);
-      continue;
-    }
-    if (epoch !== controlsEpoch || state.selectedId !== id) return;
-    state.controls = controls;
-    renderControls();
-    if (controls.state === "ready") return;
-    await sleep(700);
+  onControls(controls);
+}
+
+async function regenerateControls(id) {
+  try {
+    await api.post(`/api/requests/${id}/controls/regenerate`);
+  } catch (err) {
+    toast(err.message);
   }
 }
 
@@ -693,7 +769,6 @@ async function guarded(button, task) {
 }
 
 async function afterDecision(id) {
-  await refreshList();
   if (state.selectedId === id) await loadDetail(id);
 }
 
@@ -731,7 +806,7 @@ function send(d, button) {
 async function loadSettings() {
   try {
     const settings = await api.get("/api/settings");
-    $("#auto-forward").checked = settings.auto_forward;
+    applySettings(settings);
     return settings;
   } catch {
     return null;
@@ -787,16 +862,19 @@ function init() {
   $("#clear-btn").addEventListener("click", async () => {
     try {
       await api.post("/api/requests/clear");
-      await refreshList();
     } catch (err) {
       toast(err.message);
     }
   });
 
+  document.addEventListener("visibilitychange", () => {
+    // A sleeping laptop can leave a dead socket behind; reconnect as soon as the tab is back.
+    const alive = socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING);
+    if (!document.hidden && !alive) connect();
+  });
+
   renderDetail();
-  loadSettings();
-  refreshList();
-  setInterval(refreshList, POLL_MS);
+  connect();
 }
 
 init();
