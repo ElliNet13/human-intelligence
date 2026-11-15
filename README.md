@@ -1,81 +1,55 @@
-# human-llm-server
+# Human LLM
 
-A server that speaks the **OpenAI Chat Completions API** and the **Anthropic
-Messages API** on the wire, but the "model" is a human. Point any OpenAI or
-Anthropic SDK/client at it, and every request lands in a queue on a console
-page where a person sees exactly what a model would see — system prompt,
-full message history, tool definitions — and replies or issues tool calls
-themselves. The answer gets translated back into a real
-`chat.completion` / Anthropic `message` response, streaming included.
+An OpenAI-compatible endpoint where **you** decide, per request, whether a real
+AI answers or you do.
 
-## Run it
+- API: `http://localhost:8787/v1` (`POST /v1/chat/completions`, `GET /v1/models`; streaming and non-streaming)
+- Operator UI: `http://localhost:8787/`
+
+## Run
 
 ```bash
 pip install -r requirements.txt
-python app.py
+cp .env.example .env      # then set OLLAMA_URL
+python server.py
 ```
 
-- Console (for the human): http://localhost:8787/
-- OpenAI-compatible endpoint: `POST http://localhost:8787/v1/chat/completions`
-- Anthropic-compatible endpoint: `POST http://localhost:8787/v1/messages`
-- `GET /v1/models` — returns a single dummy `"human"` model.
+It listens on `0.0.0.0:8787`. The operator UI has no login, so keep the port off the open internet or put it behind something like Cloudflare Access.
 
-Point a client at it, e.g. with the OpenAI SDK:
+## How it works
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8787/v1", api_key="anything")
-resp = client.chat.completions.create(model="human", messages=[{"role": "user", "content": "hi"}])
-```
+1. A client sends a chat completion. It shows up in the queue in the UI and the client waits.
+2. You pick one:
+   - **Forward to AI**: the request goes to your Ollama server and the answer, streamed or not, is passed straight back.
+   - **Respond yourself**: type a reply and/or build tool calls, then Send.
+3. For tool calls, the AI reads the request's tool definitions once and writes a title, summary, labels, hints and a control type for each parameter. The UI turns them into forms. Types, required flags, enums and number ranges always come from the JSON schema; an AI choice that doesn't fit the parameter is ignored. Results are cached per tool in `data/controls_cache.json`, so a tool you have seen before costs nothing. If the AI is unavailable, forms built from the schema alone are used.
 
-or the Anthropic SDK:
+### Control types
 
-```python
-import anthropic
-client = anthropic.Anthropic(base_url="http://localhost:8787", api_key="anything")
-resp = client.messages.create(model="human", max_tokens=512, messages=[{"role": "user", "content": "hi"}])
-```
+| Parameter | Controls the AI can pick |
+|---|---|
+| string | text (one line), textarea (multi-line), password, combo (text plus suggestions) |
+| enum | select (dropdown), radio |
+| integer / number | number, slider (needs a min and max) |
+| boolean | checkbox, select, radio |
+| array of enum values | multiselect (checkboxes), list, json |
+| array of strings/numbers | list (one per line), json |
+| object / other | json |
 
-Both requests will sit and wait until someone opens the console, reads the
-request, and sends a reply. Nothing is persisted — restart the server and
-any in-flight requests are gone (callers will just time out).
+## Configuration
 
-## How answering works
+`.env` (see `.env.example`):
 
-Open the console, click a pending "ticket" in the left column. You'll see:
+| Variable | Default | Meaning |
+|---|---|---|
+| `OLLAMA_URL` | none | Your Ollama server, e.g. `http://localhost:11434` (`/v1` is added automatically) |
+| `OLLAMA_API_KEY` | empty | Only if something in front of Ollama wants a bearer token |
+| `OLLAMA_MODEL` | `mimo_v2.6:latest` | Initial AI model |
+| `PORT` | `8787` | Listen port |
+| `HOST` | `0.0.0.0` | Listen address |
+| `API_KEY` | empty | If set, clients must send `Authorization: Bearer <key>` to `/v1/*` |
+| `DATA_DIR` | `./data` | Where settings and the control cache are stored |
 
-- the system prompt (if any)
-- the full message thread, including prior tool calls and tool results
-- the tool definitions (name, description, JSON schema) available for this
-  request, via the "Tools" toggle
+The gear icon in the UI changes the AI model, and optionally a separate model for reading tools (blank means the same model). These are saved in `data/settings.json`. When forwarding, the client's model name is replaced by the AI model; clear the field to pass the client's name through.
 
-Write a text reply, and/or click **+ Add tool call** to pick a tool and fill
-in its JSON arguments — you can add as many as you like, in any order, just
-like a model choosing to call several tools in one turn. Hit **Send reply**
-and the waiting client gets back a properly-shaped response:
-`finish_reason: "tool_calls"` / `stop_reason: "tool_use"` if you issued any
-tool calls, `"stop"` / `"end_turn"` otherwise.
-
-Note that — same as a real model — the human doesn't execute tools. You only
-decide *that* a tool should be called and with what arguments; the actual
-execution and the tool's result come back from the calling application in
-its next request, appearing in the thread as a `tool_result` block.
-
-## Config
-
-- `SERVER_API_KEY` — if set, callers must send this value as `x-api-key`
-  (Anthropic-style) or `Authorization: Bearer <key>` (OpenAI-style). Unset
-  by default, since this is meant for local/dev use.
-- `RESPONSE_TIMEOUT_SECONDS` — how long a caller blocks waiting for a human
-  before getting a 504 (default 1800 = 30 min).
-- `PORT` — default 8787.
-
-## Limitations
-
-- No persistence — it's a single in-memory queue, run one process.
-- "Streaming" is emulated: the human's finished answer is chunked into a
-  real SSE stream shape (SSE event types match the real APIs), but it isn't
-  token-by-token from a live model.
-- No image rendering in the console yet (image blocks show as a placeholder).
-- This is a devtime/novelty tool, not hardened for the open internet — put
-  it behind your own auth/reverse proxy if it's reachable beyond localhost.
+The prompt that turns tool definitions into controls is `controls_prompt.txt`; editing it invalidates the cache automatically.

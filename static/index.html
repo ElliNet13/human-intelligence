@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Human LLM</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="side-head">
+        <h1>Human LLM</h1>
+        <button id="settings-btn" class="icon-btn" type="button" title="Settings" aria-label="Settings">&#9881;</button>
+      </header>
+      <div class="side-options">
+        <label class="toggle"><input type="checkbox" id="auto-forward"> Auto-forward everything to AI</label>
+        <label class="toggle"><input type="checkbox" id="sound"> Beep on new request</label>
+        <button id="clear-btn" class="link-btn" type="button">Clear finished</button>
+      </div>
+      <ul id="queue" class="queue"></ul>
+    </aside>
+
+    <main id="detail" class="detail"></main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="settings-dialog">
+    <form id="settings-form" method="dialog">
+      <h2>Settings</h2>
+      <p class="muted">The AI runs on the Ollama server set in <code>.env</code>. It is used for "Forward to AI" and for reading tool definitions.</p>
+      <div class="field">
+        <span class="field-label">Ollama server</span>
+        <code id="set-ollama-url"></code>
+      </div>
+      <label class="field">
+        <span class="field-label">AI model</span>
+        <input id="set-forward-model" type="text" placeholder="mimo_v2.6:latest">
+        <span class="field-help">Used when forwarding. Blank keeps the model name the client sent.</span>
+      </label>
+      <label class="field">
+        <span class="field-label">Model for reading tools</span>
+        <input id="set-controls-model" type="text" placeholder="blank = same as AI model">
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="settings-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
