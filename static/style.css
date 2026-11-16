@@ -156,6 +156,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
   border-bottom: 1px solid var(--border);
 }
 .detail-head .grow { flex: 1; min-width: 160px; }
+.detail-head .note { color: var(--warn); font-size: 12.5px; margin-top: 2px; }
 .detail-head .sub { color: var(--muted); font-size: 12.5px; }
 .head-actions { display: flex; gap: 8px; }
 
@@ -186,6 +187,23 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
   border-top: 1px solid var(--border);
   background: var(--panel);
 }
+
+.auto-box { border-top: 1px solid var(--border); background: var(--panel); max-height: 40%; overflow: auto; }
+.auto-box > summary { cursor: pointer; padding: 8px 14px; color: var(--muted); font-weight: 600; }
+.auto-queue { list-style: none; margin: 0; padding: 0; }
+.auto-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 2px 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+}
+.auto-item:hover { background: var(--panel-2); }
+.auto-item.active { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+.auto-item .qi-preview { grid-column: 1 / -1; margin: 0; color: var(--muted); }
+.auto-kind { font-weight: 600; }
 
 /* Conversation */
 .params { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
@@ -362,3 +380,62 @@ dialog form { display: flex; flex-direction: column; gap: 12px; }
   .detail-body.split { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) minmax(0, 1.4fr); }
   .col.compose { border-left: none; border-top: 1px solid var(--border); }
 }
+
+/* ---- progress while the AI reads tools */
+.bar {
+  height: 6px;
+  margin: 6px 0 2px;
+  background: var(--panel-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.bar[hidden] { display: none; }
+.bar .fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.25s ease;
+}
+.tool-tag { font-size: 11px; padding: 0 7px; border-radius: 9px; border: 1px solid var(--border); color: var(--muted); }
+.tool-tag.read { color: var(--ok); border-color: var(--ok); }
+
+/* ---- array and object editors */
+.arr { display: flex; flex-direction: column; gap: 6px; }
+.arr-rows { display: flex; flex-direction: column; gap: 6px; }
+.arr-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: start;
+}
+.arr-row.nested {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+.arr-index { color: var(--muted); font-size: 12px; font-family: var(--mono); padding-top: 8px; text-align: right; }
+.arr-item { min-width: 0; }
+.arr-ctl { display: flex; gap: 3px; }
+.arr-foot { display: flex; align-items: center; gap: 10px; }
+.btn.icon { min-width: 28px; padding-left: 6px; padding-right: 6px; }
+
+.obj { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.obj-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.obj-label { font-weight: 600; font-size: 12.5px; }
+.obj .obj { padding-left: 10px; border-left: 2px solid var(--border); }
+
+/* ---- why a request is a separate chat */
+.muted.small { font-size: 12px; }
+.grouping { margin-top: 6px; font-size: 12.5px; }
+.grouping > summary { cursor: pointer; color: var(--muted); }
+.cmp { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 12px; table-layout: fixed; }
+.cmp th, .cmp td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+.cmp th:first-child, .cmp td:first-child { width: 28px; }
+.cmp th:last-child, .cmp td:last-child { width: 64px; color: var(--muted); }
+.cmp tr.same td:last-child { color: var(--ok); }
+.cmp tr.close td:last-child { color: var(--warn); }
+.cmp tr.differs td:last-child, .cmp tr.only-new td:last-child, .cmp tr.only-old td:last-child { color: var(--danger); }
+.merge-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.merge-row select { flex: 1; min-width: 0; width: auto; }

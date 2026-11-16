@@ -18,10 +18,15 @@
       </header>
       <div class="side-options">
         <label class="toggle"><input type="checkbox" id="auto-forward"> Auto-forward everything to AI</label>
+        <label class="toggle"><input type="checkbox" id="auto-utility"> Auto-handle titles, tags &amp; follow-ups</label>
         <label class="toggle"><input type="checkbox" id="sound"> Beep on new request</label>
         <button id="clear-btn" class="link-btn" type="button">Clear finished</button>
       </div>
       <ul id="queue" class="queue"></ul>
+      <details id="auto-box" class="auto-box" hidden>
+        <summary>Auto-handled (<span id="auto-count">0</span>)</summary>
+        <ul id="auto-queue" class="auto-queue"></ul>
+      </details>
     </aside>
 
     <main id="detail" class="detail"></main>
@@ -53,6 +58,7 @@
     </form>
   </dialog>
 
+  <script src="/static/editors.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -16,7 +16,7 @@ Reply with ONLY one JSON object, no prose and no code fences, shaped like this:
         "label": "<short human label, 1-4 words>",
         "help": "<one short hint: what to enter, units, format. Empty string if obvious>",
         "widget": "<one control type from the list below>",
-        "default": <a sensible pre-filled value matching the parameter, or null>,
+        "default": <a sensible pre-filled value matching the parameter, or null. For "array" and "object" use null>,
         "options": [<only for "combo": up to 8 plausible suggestions>],
         "min": <only for "slider">,
         "max": <only for "slider">,
@@ -32,9 +32,11 @@ Control types (the "widget" value). Pick the one that is quickest for a human to
 - string/number with "enum": select (dropdown, best for long lists), radio (best for 2-4 choices)
 - integer / number:      number (typed), slider (only when a sensible min and max exist, in the schema or in your "min"/"max")
 - boolean:               checkbox (default choice), select, radio
-- array of enum values:  multiselect (checkboxes), list, json
-- array of strings or numbers: list (one item per line), json
-- object or anything else: json
+- array of enum values:  multiselect (checkboxes), array, list, json
+- array (of strings, numbers, objects or anything else): array (a list of rows the operator can add, remove and reorder; each row is built from the item schema, so objects get a small form per row). This is the best choice for arrays of objects.
+- array of strings or numbers: also list (one item per line) or json
+- object with known properties: object (a nested form), json
+- anything else: json
 
 Rules:
 - Include every tool you were given, and one field per top-level parameter. Never invent, rename or drop parameters.

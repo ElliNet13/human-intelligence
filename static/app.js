@@ -176,12 +176,13 @@ function handleEvent(msg) {
   }
 }
 
+// Background tasks (titles, tags...) are answered by the AI on their own; they are not announced.
 function announceNew(summaries) {
   let announce = false;
   for (const r of summaries) {
     if (!state.seen.has(r.id)) {
       state.seen.add(r.id);
-      if (r.status === "pending") announce = true;
+      if (r.status === "pending" && !r.auto) announce = true;
     }
   }
   if (announce && $("#sound").checked) beep();
@@ -195,8 +196,20 @@ function clearSelection() {
 }
 
 function autoSelect() {
-  const first = sortedRequests()[0];
+  const first = heads()[0];
   if (first) select(first.id);
+}
+
+// When the chat you are looking at gets a newer turn, move to it. An unsent draft comes along.
+function followChat(newer) {
+  if (newer.auto || !state.selectedId || newer.id === state.selectedId) return false;
+  const current = state.requests.find((r) => r.id === state.selectedId);
+  if (!current || current.auto || current.conversation !== newer.conversation || newer.created <= current.created) return false;
+  const draft = drafts.get(current.id);
+  if (draft && current.status !== "answered" && current.status !== "forwarded") drafts.set(newer.id, draft);
+  drafts.delete(current.id);
+  select(newer.id);
+  return true;
 }
 
 // Sent on every (re)connect: the full queue, so nothing missed while offline stays missed.
@@ -212,6 +225,8 @@ function onHello(msg) {
     return;
   }
   const current = state.requests.find((r) => r.id === state.selectedId);
+  const head = current.auto ? null : heads().find((r) => r.conversation === current.conversation);
+  if (head && followChat(head)) return;
   if (!state.detail || state.detail.status !== current.status) loadDetail(current.id);
   else if (current.status === "pending" && state.detail.tool_names.length) fetchControls(current.id);
 }
@@ -221,11 +236,12 @@ function onRequest(summary) {
   if (index === -1) state.requests.push(summary);
   else state.requests[index] = summary;
   announceNew([summary]);
+  if (followChat(summary)) return;
+  renderQueue();
   if (!state.selectedId) {
     autoSelect();
     return;
   }
-  renderQueue();
   if (summary.id === state.selectedId && state.detail && state.detail.status !== summary.status) loadDetail(summary.id);
 }
 
@@ -245,33 +261,53 @@ function onControls(controls) {
 }
 
 function applySettings(settings) {
-  if (settings) $("#auto-forward").checked = settings.auto_forward;
+  if (!settings) return;
+  $("#auto-forward").checked = settings.auto_forward;
+  $("#auto-utility").checked = settings.auto_utility;
 }
 
 // ------------------------------------------------------------------ queue
 
-function sortedRequests() {
-  const pending = state.requests.filter((r) => r.status === "pending").sort((a, b) => a.created - b.created);
-  const rest = state.requests.filter((r) => r.status !== "pending").sort((a, b) => b.created - a.created);
+// One entry per chat: its newest request, except that a request still waiting for you is never hidden
+// behind a newer finished one. Background tasks are listed apart.
+function heads() {
+  const newest = new Map();
+  for (const r of state.requests) {
+    if (r.auto) continue;
+    const seen = newest.get(r.conversation);
+    const waiting = r.status === "pending";
+    const seenWaiting = seen && seen.status === "pending";
+    if (!seen || (waiting && !seenWaiting) || (waiting === seenWaiting && r.created > seen.created)) newest.set(r.conversation, r);
+  }
+  const all = [...newest.values()];
+  const pending = all.filter((r) => r.status === "pending").sort((a, b) => a.created - b.created);
+  const rest = all.filter((r) => r.status !== "pending").sort((a, b) => b.created - a.created);
   return [...pending, ...rest];
 }
 
+function autoHandled() {
+  return state.requests.filter((r) => r.auto).sort((a, b) => b.created - a.created);
+}
+
 function renderQueue() {
+  const selected = state.requests.find((r) => r.id === state.selectedId);
   const list = $("#queue");
   list.replaceChildren();
-  const items = sortedRequests();
+  const items = heads();
   if (!items.length) {
-    list.append(h("li", { class: "queue-empty" }, "No requests yet. Point a client at this server's /v1 endpoint and send one."));
+    list.append(h("li", { class: "queue-empty" }, "No chats yet. Point a client at this server's /v1 endpoint and send a message."));
   }
   for (const r of items) {
     const meta = [
       r.model || "?",
+      r.turn > 1 ? `turn ${r.turn}` : null,
       `${r.message_count} msg`,
       r.tool_count ? `${r.tool_count} tools` : null,
       r.stream ? "stream" : null,
     ].filter(Boolean).join(" · ");
+    const active = selected && !selected.auto && selected.conversation === r.conversation;
     list.append(
-      h("li", { class: "queue-item" + (r.id === state.selectedId ? " active" : ""), onclick: () => select(r.id) },
+      h("li", { class: "queue-item" + (active ? " active" : ""), onclick: () => select(r.id) },
         h("div", { class: "qi-top" },
           h("span", { class: `badge ${r.status}` }, STATUS_LABELS[r.status] ?? r.status),
           h("span", { class: "qi-time" }, fmtTime(r.created))),
@@ -279,7 +315,18 @@ function renderQueue() {
         h("div", { class: "qi-preview" }, r.preview))
     );
   }
-  const waiting = state.requests.filter((r) => r.status === "pending").length;
+
+  const background = autoHandled().slice(0, 30);
+  $("#auto-box").hidden = background.length === 0;
+  $("#auto-count").textContent = String(background.length);
+  $("#auto-queue").replaceChildren(...background.map((r) =>
+    h("li", { class: "auto-item" + (r.id === state.selectedId ? " active" : ""), onclick: () => select(r.id) },
+      h("span", { class: `badge ${r.status}` }, STATUS_LABELS[r.status] ?? r.status),
+      h("span", { class: "auto-kind" }, r.kind),
+      h("span", { class: "qi-time" }, fmtTime(r.created)),
+      h("div", { class: "qi-preview" }, r.preview))));
+
+  const waiting = items.filter((r) => r.status === "pending").length;
   document.title = waiting ? `(${waiting}) Human LLM` : "Human LLM";
 }
 
@@ -317,6 +364,8 @@ function renderDetail() {
   root.replaceChildren();
   ui.controlsBox = null;
   ui.controlsStatus = null;
+  ui.controlsBar = null;
+  ui.cards = new Map();
   ui.renderStaged = null;
   const d = state.detail;
   if (!d) {
@@ -346,9 +395,51 @@ function renderHeader(d) {
   return h("header", { class: "detail-head" },
     h("div", { class: "grow" },
       h("h2", {}, `Request ${d.id}`),
-      h("div", { class: "sub" }, `${d.model || "no model"} · ${fmtTime(d.created)}${d.stream ? " · streaming" : ""}`)),
+      h("div", { class: "sub" }, [
+        d.model || "no model",
+        fmtTime(d.created),
+        d.auto ? `background task: ${d.kind}` : d.turn > 1 ? `turn ${d.turn} of this chat` : null,
+        d.stream ? "streaming" : null,
+      ].filter(Boolean).join(" · ")),
+      d.note ? h("div", { class: "note" }, d.note) : null,
+      renderGrouping(d)),
     h("span", { class: `badge ${d.status}` }, STATUS_LABELS[d.status] ?? d.status),
     actions);
+}
+
+// Shown for a request that started a chat of its own: why it did not match another one, and a way to merge by hand.
+function renderGrouping(d) {
+  if (d.auto) return null;
+  const others = heads().filter((r) => r.conversation !== d.conversation);
+  const idLine = d.chat_id ? h("div", { class: "muted small" }, `Chat id sent by the client: ${d.chat_id}`) : null;
+  if (d.turn > 1 || !others.length) return idLine;
+
+  const match = d.match;
+  const select = h("select", {}, others.map((r) =>
+    h("option", { value: r.conversation, selected: match ? match.conversation === r.conversation : false },
+      `${fmtTime(r.created)} · ${truncate(r.preview, 70)}`)));
+  const merge = h("button", {
+    class: "btn small", type: "button",
+    onclick: (e) => guarded(e.currentTarget, async () => {
+      await api.post(`/api/requests/${d.id}/join`, { conversation: select.value });
+      toast("Merged into the chat.");
+      await loadDetail(d.id);
+    }),
+  }, "Merge");
+
+  const parts = [h("summary", {}, "Why is this a separate chat?")];
+  if (match) {
+    parts.push(
+      h("div", { class: "muted small" },
+        `Closest other chat (${match.old_count} user/tool messages; this one has ${match.new_count}):`),
+      h("table", { class: "cmp" },
+        h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Other chat"), h("th", {}, "This request"), h("th", {}, ""))),
+        h("tbody", {}, match.rows.map((row) =>
+          h("tr", { class: row.state },
+            h("td", {}, row.index), h("td", {}, row.old), h("td", {}, row.new), h("td", {}, row.state))))));
+  }
+  parts.push(h("div", { class: "merge-row" }, h("span", {}, "Merge into:"), select, merge));
+  return h("div", {}, idLine, h("details", { class: "grouping" }, parts));
 }
 
 function renderParams(d) {
@@ -447,6 +538,8 @@ function renderComposer(d) {
   if (d.tool_names.length) {
     ui.controlsStatus = h("span", { class: "controls-status" }, "Loading controls…");
     ui.controlsBox = h("div", { class: "controls" });
+    ui.controlsBar = h("div", { class: "bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100", hidden: true },
+      h("div", { class: "fill" }));
     const filter = h("input", {
       type: "text",
       placeholder: "Filter tools…",
@@ -458,6 +551,7 @@ function renderComposer(d) {
         h("h3", { class: "grow" }, `Tools (${d.tool_names.length})`),
         ui.controlsStatus,
         h("button", { class: "btn small", type: "button", onclick: () => regenerateControls(d.id) }, "Re-read tools")),
+      ui.controlsBar,
       d.tool_names.length > 6 ? filter : null,
       ui.controlsBox,
       customCallCard(d, draft));
@@ -502,7 +596,10 @@ function customCallCard(d, draft) {
 // ---------------------------------------------------------- tool controls
 
 function controlsStatusText(c) {
-  if (c.state === "working") return { text: "AI is reading the tools… basic controls shown meanwhile", cls: "working" };
+  if (c.state === "working") {
+    const progress = c.total ? ` ${c.done} of ${c.total}` : "";
+    return { text: `Reading tools…${progress} (basic controls shown meanwhile)`, cls: "working" };
+  }
   if (c.error) return { text: `AI could not help (${c.error}). Using controls built from the schemas.`, cls: "problem" };
   return { text: "Controls ready", cls: "" };
 }
@@ -534,13 +631,34 @@ function renderControls() {
   const status = controlsStatusText(c);
   ui.controlsStatus.textContent = status.text;
   ui.controlsStatus.className = `controls-status ${status.cls}`;
+  const working = c.state === "working";
+  if (ui.controlsBar) {
+    const percent = c.total ? Math.min(100, Math.round((100 * c.done) / c.total)) : 0;
+    ui.controlsBar.hidden = !working;
+    ui.controlsBar.firstElementChild.style.width = `${percent}%`;
+    ui.controlsBar.setAttribute("aria-valuenow", String(percent));
+  }
   const needle = draft.filter.trim().toLowerCase();
   const visible = c.controls.filter((spec) =>
     !needle || `${spec.name} ${spec.title} ${spec.summary}`.toLowerCase().includes(needle));
-  box.replaceChildren(...visible.map((spec) => toolCard(spec, draft)));
+  // Cards that did not change keep their DOM, so a form being typed into is not rebuilt by each progress push.
+  const wanted = visible.map((spec) => {
+    const tag = working ? (spec.source === "ai" ? "read" : "waiting") : "";
+    const signature = JSON.stringify([spec, tag]);
+    const cached = ui.cards.get(spec.name);
+    if (cached && cached.signature === signature) return cached.node;
+    const node = toolCard(spec, draft, tag);
+    ui.cards.set(spec.name, { signature, node });
+    return node;
+  });
+  const keep = new Set(wanted);
+  for (const child of [...box.children]) if (!keep.has(child)) child.remove();
+  wanted.forEach((node, index) => {
+    if (box.children[index] !== node) box.insertBefore(node, box.children[index] || null);
+  });
 }
 
-function toolCard(spec, draft) {
+function toolCard(spec, draft, tag) {
   const err = h("div", { class: "tool-err" });
   const details = h("details", {
     class: "tool",
@@ -553,6 +671,7 @@ function toolCard(spec, draft) {
     h("summary", {},
       h("span", { class: "tool-title" }, spec.title),
       h("code", { class: "tool-name" }, spec.name),
+      tag ? h("span", { class: `tool-tag ${tag}` }, tag === "read" ? "read" : "waiting…") : null,
       spec.summary ? h("span", { class: "tool-summary" }, spec.summary) : null),
     h("div", { class: "fields" },
       spec.fields.length ? spec.fields.map((f) => fieldRow(spec, f, draft)) : h("div", { class: "muted" }, "No parameters.")),
@@ -684,13 +803,26 @@ function fieldInput(f, initial, setValue, idBase) {
 
 function fieldRow(spec, f, draft) {
   const values = (draft.values[spec.name] ??= {});
-  const initial = values[f.key] !== undefined ? values[f.key] : defaultText(f);
+  const nested = f.widget === "array" || f.widget === "object";
+  // A value kept from before the control type changed (say list -> array) no longer fits; start over.
+  if (values[f.key] !== undefined && (typeof values[f.key] === "string") === nested) delete values[f.key];
   const idBase = `f-${spec.name}-${f.key}`.replace(/[^A-Za-z0-9_-]/g, "_");
-  const input = fieldInput(f, initial, (value) => { values[f.key] = value; }, idBase);
-  const kind = f.type === "array" ? `${f.item_type || "value"}[]` : f.type;
+  let input;
+  let kind = f.type === "array" ? `${f.item_type || "value"}[]` : f.type;
+  if (nested) {
+    const schema = f.schema || fallbackSchema(f);
+    if (values[f.key] === undefined) {
+      values[f.key] = f.default !== null && f.default !== undefined ? rawFrom(f.default, schema) : freshRaw(schema);
+    }
+    input = buildEditor(schema, values, f.key, f.key, f.required);
+    kind = f.widget === "object" ? "object" : `${kindOf(isPlainObject(schema.items) ? schema.items : {})}[]`;
+  } else {
+    const initial = values[f.key] !== undefined ? values[f.key] : defaultText(f);
+    input = fieldInput(f, initial, (value) => { values[f.key] = value; }, idBase);
+  }
 
-  // Radio and multiselect groups hold several inputs, so they use a div rather than a label.
-  const wrapper = f.widget === "radio" || f.widget === "multiselect" ? "div" : "label";
+  // Radio, multiselect and nested editors hold several inputs, so they use a div rather than a label.
+  const wrapper = nested || f.widget === "radio" || f.widget === "multiselect" ? "div" : "label";
   return h(wrapper, { class: "field" },
     h("span", { class: "field-label" },
       f.label,
@@ -716,6 +848,23 @@ function collectArgs(spec, draft) {
   const args = {};
   const problems = [];
   for (const f of spec.fields) {
+    if (f.widget === "array" || f.widget === "object") {
+      try {
+        const schema = f.schema || fallbackSchema(f);
+        const tree = values[f.key] !== undefined && typeof values[f.key] !== "string"
+          ? values[f.key]
+          : f.default !== null && f.default !== undefined ? rawFrom(f.default, schema) : freshRaw(schema);
+        const value = toValue(tree, schema, f.label);
+        if (isOmittable(value) && (!f.required || value === undefined)) {
+          if (f.required) problems.push(`${f.label} is required`);
+          continue;
+        }
+        args[f.key] = value;
+      } catch (err) {
+        problems.push(err.message);
+      }
+      continue;
+    }
     const raw = values[f.key] !== undefined ? values[f.key] : defaultText(f);
     if (isEmptyValue(f, raw)) {
       if (!f.required) continue;
@@ -845,14 +994,16 @@ function init() {
   $("#settings-cancel").addEventListener("click", () => $("#settings-dialog").close());
   $("#settings-form").addEventListener("submit", saveSettings);
 
-  $("#auto-forward").addEventListener("change", async (e) => {
-    try {
-      await api.post("/api/settings", { auto_forward: e.target.checked });
-    } catch (err) {
-      toast(err.message);
-      e.target.checked = !e.target.checked;
-    }
-  });
+  for (const [selector, key] of [["#auto-forward", "auto_forward"], ["#auto-utility", "auto_utility"]]) {
+    $(selector).addEventListener("change", async (e) => {
+      try {
+        await api.post("/api/settings", { [key]: e.target.checked });
+      } catch (err) {
+        toast(err.message);
+        e.target.checked = !e.target.checked;
+      }
+    });
+  }
 
   $("#sound").addEventListener("change", (e) => {
     if (e.target.checked && !audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();

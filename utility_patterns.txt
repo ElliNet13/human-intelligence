@@ -1,0 +1,24 @@
+# Recognises prompts that a chat client sends by itself in the background (chat titles, tags,
+# follow-up suggestions...). They are answered by the AI automatically and listed under
+# "Auto-handled" instead of the main queue.
+#
+# One pattern per line:   label :: regular expression
+#   - matched, case-insensitively, against the start of the LAST USER message
+#   - a line without " :: " gets the label "background task"
+#   - lines starting with # and blank lines are ignored
+#   - the file is read when the server starts
+#
+# Add your own lines for other clients, e.g.:
+#   title :: \AGenerate a short title for this conversation
+
+# --- Open WebUI task prompts (every one starts with "### Task:") ---
+title :: \A\s*### Task:\s*Generate a concise, \d+-\d+ word title
+tags :: \A\s*### Task:\s*Generate \d+-\d+ broad tags
+follow-ups :: \A\s*### Task:\s*Suggest \d+-\d+ relevant follow-up
+search queries :: \A\s*### Task:\s*Analy[sz]e the chat history to determine the necessity of generating search queries
+autocomplete :: \A\s*### Task:\s*You are an autocompletion system
+image prompt :: \A\s*### Task:\s*Generate a detailed prompt for a[mn] image generation
+
+# Catch-all for other "### Task:" templates that embed the conversation to process.
+# (Open WebUI's normal answer prompt has no <chat_history>, so real questions are not caught.)
+background task :: \A\s*### Task:[\s\S]{0,4000}?<chat_history>

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import json
 import logging
@@ -19,7 +20,7 @@ import os
 import re
 import secrets
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeGuard, cast
@@ -79,7 +80,17 @@ DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "").strip() or "mimo_v2.6:latest"
 MAX_HISTORY = 100
 KEEPALIVE_SECONDS = 15.0
 HUB_QUEUE_LIMIT = 500
+AUTO_HISTORY = 30  # finished background-task requests kept for inspection; separate from MAX_HISTORY
+CHAT_MEMORY_LIMIT = 300
+# Finished background tasks remove themselves from the list after this long (errors stay 10x longer); 0 keeps them.
+AUTO_CLEAR_SECONDS = float(os.environ.get("AUTO_CLEAR_SECONDS", "60"))
+UTILITY_SCAN_CHARS = 8000
+UTILITY_PATTERNS_FILE = Path(os.environ.get("UTILITY_PATTERNS_FILE", str(BASE_DIR / "utility_patterns.txt")))
+CHAT_ID_HEADERS = ("x-openwebui-chat-id", "x-chat-id", "x-conversation-id", "x-thread-id")
+CHAT_ID_FIELDS = ("chat_id", "conversation_id", "thread_id")
 CONTROLS_BATCH = 6
+MAX_SCHEMA_DEPTH = 6  # how deep arrays and objects nest before a value falls back to a JSON box
+SPEC_VERSION = "2"  # bump when the shape of a control spec changes, so cached specs are rebuilt
 UPSTREAM_TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 
 CONTROLS_PROMPT = (BASE_DIR / "controls_prompt.txt").read_text(encoding="utf-8")
@@ -165,6 +176,7 @@ class Settings:
     forward_model: str = DEFAULT_MODEL  # model used when forwarding; blank keeps the client's model name
     controls_model: str = ""  # model that reads tools; blank means forward_model
     auto_forward: bool = False
+    auto_utility: bool = True  # answer the client's titles/tags/follow-ups with the AI, without asking
 
 
 def load_settings() -> Settings:
@@ -177,9 +189,10 @@ def load_settings() -> Settings:
         value = raw.get(name)
         if isinstance(value, str):
             setattr(settings, name, value)
-    auto = raw.get("auto_forward")
-    if isinstance(auto, bool):
-        settings.auto_forward = auto
+    for flag in ("auto_forward", "auto_utility"):
+        value = raw.get(flag)
+        if isinstance(value, bool):
+            setattr(settings, flag, value)
     return settings
 
 
@@ -246,13 +259,14 @@ def describe_exception(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}".rstrip(": ")
 
 
-async def call_upstream_json(model: str, system: str, user: str) -> str:
-    """One non-streaming chat call that should answer with a JSON object."""
+async def stream_upstream_text(model: str, system: str, user: str) -> AsyncIterator[str]:
+    """One streaming chat call that should answer with a JSON object; yields the reply text as it arrives."""
     if not model:
         raise RuntimeError("No model to use for control generation (set one in Settings).")
     url = upstream_url("/chat/completions")
     payload: dict[str, Any] = {
         "model": model,
+        "stream": True,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -263,19 +277,49 @@ async def call_upstream_json(model: str, system: str, user: str) -> str:
             data = dict(payload)
             if use_json_mode:
                 data["response_format"] = {"type": "json_object"}
-            resp = await client.post(url, json=data, headers=upstream_headers())
-            if resp.status_code == 400 and use_json_mode:
-                continue  # some servers reject response_format; retry without it
-            if resp.status_code >= 400:
-                raise RuntimeError(upstream_error_message(resp.status_code, resp.text))
-            choices = as_list(as_dict(resp.json()).get("choices"))
-            message = as_dict(as_dict(choices[0]).get("message")) if choices else {}
-            return content_text(message.get("content"))
+            async with client.stream("POST", url, json=data, headers=upstream_headers()) as resp:
+                if resp.status_code == 400 and use_json_mode:
+                    await resp.aread()
+                    continue  # some servers reject response_format; retry without it
+                if resp.status_code >= 400:
+                    text = (await resp.aread()).decode("utf-8", "replace")
+                    raise RuntimeError(upstream_error_message(resp.status_code, text))
+                if "json" in resp.headers.get("content-type", "") and "event-stream" not in resp.headers.get("content-type", ""):
+                    # A server that ignored stream=true and sent the whole answer at once.
+                    whole = as_dict(json.loads((await resp.aread()).decode("utf-8", "replace")))
+                    choices = as_list(whole.get("choices"))
+                    message = as_dict(as_dict(choices[0]).get("message")) if choices else {}
+                    yield content_text(message.get("content"))
+                    return
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        chunk = as_dict(json.loads(raw))
+                    except ValueError:
+                        continue
+                    for choice in as_list(chunk.get("choices")):
+                        piece = as_dict(as_dict(choice).get("delta")).get("content")
+                        if isinstance(piece, str) and piece:
+                            yield piece
+                return
     raise RuntimeError("Upstream rejected the control-generation request.")
 
 
+def strip_reasoning(text: str) -> str:
+    """Drop <think> blocks, including one that is still being written."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    if "</think>" in text:  # a model that starts inside its reasoning
+        text = text.split("</think>", 1)[1]
+    open_at = text.find("<think>")
+    return (text[:open_at] if open_at != -1 else text).strip()
+
+
 def extract_json(text: str) -> Any:
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    text = strip_reasoning(text)
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     if fenced:
         text = fenced.group(1).strip()
@@ -318,7 +362,7 @@ def normalize_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 def tool_key(tool: dict[str, Any]) -> str:
     raw = json.dumps(tool, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256((PROMPT_SALT + raw).encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256((PROMPT_SALT + SPEC_VERSION + raw).encode("utf-8")).hexdigest()[:32]
 
 
 def schema_type(schema: dict[str, Any]) -> str:
@@ -342,24 +386,80 @@ def is_number(value: Any) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
 
 
+KEPT_SCHEMA_KEYS = ("description", "title", "default", "enum", "format", "minimum", "maximum")
+
+
+def resolve_ref(ref: str, root: dict[str, Any]) -> dict[str, Any]:
+    if not ref.startswith("#/"):
+        return {}
+    node: Any = root
+    for part in ref[2:].split("/"):
+        node = as_dict(node).get(part.replace("~1", "/").replace("~0", "~"))
+    return as_dict(node)
+
+
+def settle_schema(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+    """Follow $ref and fold "X or null" unions, so the schema says directly what the value is."""
+    for _ in range(6):
+        ref = schema.get("$ref")
+        if isinstance(ref, str):
+            schema = {**resolve_ref(ref, root), **{k: v for k, v in schema.items() if k != "$ref"}}
+            continue
+        folded = False
+        for union in ("anyOf", "oneOf", "allOf"):
+            options = [as_dict(o) for o in as_list(schema.get(union))]
+            real = [o for o in options if schema_type(o) != "null"]
+            if options and len(real) == 1:
+                rest = {k: v for k, v in schema.items() if k != union}
+                schema = {**real[0], **rest}
+                folded = True
+                break
+        if not folded:
+            break
+    return schema
+
+
+def simplify_schema(schema: dict[str, Any], root: dict[str, Any], depth: int = 0) -> dict[str, Any]:
+    """A property's schema reduced to what the form needs: type, enum, bounds, items, properties and required."""
+    schema = settle_schema(schema, root)
+    out: dict[str, Any] = {k: schema[k] for k in KEPT_SCHEMA_KEYS if k in schema}
+    items = schema.get("items")
+    props = as_dict(schema.get("properties"))
+    kind = schema_type(schema)
+    if not kind:
+        kind = "object" if props else "array" if isinstance(items, dict) else ""
+    if kind:
+        out["type"] = kind
+    if depth >= MAX_SCHEMA_DEPTH:
+        return out
+    if isinstance(items, dict):
+        out["items"] = simplify_schema(cast(dict[str, Any], items), root, depth + 1)
+    if props:
+        out["properties"] = {key: simplify_schema(as_dict(value), root, depth + 1) for key, value in props.items()}
+        out["required"] = [r for r in as_list(schema.get("required")) if isinstance(r, str)]
+    return out
+
+
 def describe_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a JSON Schema property to what decides which widgets make sense."""
+    """Reduce a (simplified) property schema to what decides which widgets make sense."""
     kind = schema_type(schema)
     options = scalar_enum(schema.get("enum"))
     if options and kind not in ("string", "integer", "number", "boolean"):
         first = options[0]
         kind = "boolean" if isinstance(first, bool) else "string" if isinstance(first, str) else "number"
-    info: dict[str, Any] = {"kind": kind if kind in ("string", "integer", "number", "boolean", "array") else "json"}
-    info["options"] = options
-    info["item_kind"] = ""
-    info["item_options"] = []
+    if kind == "object" and not as_dict(schema.get("properties")):
+        kind = ""  # a free-form object has no fields to build a form from
+    info: dict[str, Any] = {
+        "kind": kind if kind in ("string", "integer", "number", "boolean", "array", "object") else "json",
+        "options": options,
+        "item_kind": "",
+        "item_options": [],
+    }
     if info["kind"] == "array":
         items = as_dict(schema.get("items"))
         item_kind = schema_type(items)
         info["item_kind"] = item_kind if item_kind in ("string", "integer", "number") else ""
         info["item_options"] = scalar_enum(items.get("enum"))
-        if not info["item_kind"] and not info["item_options"]:
-            info["kind"] = "json"
     return info
 
 
@@ -382,7 +482,14 @@ def allowed_widgets(info: dict[str, Any], ranged: bool) -> list[str]:
     if kind == "boolean":
         return ["checkbox", "select", "radio"]
     if kind == "array":
-        return ["multiselect", "list", "json"] if info["item_options"] else ["list", "json"]
+        widgets = ["multiselect"] if info["item_options"] else []
+        widgets.append("array")  # rows that can be added, removed and reordered
+        if info["item_kind"]:
+            widgets.append("list")
+        widgets.append("json")
+        return widgets
+    if kind == "object":
+        return ["object", "json"]
     return ["json"]
 
 
@@ -394,6 +501,11 @@ def widget_options(widget: str, info: dict[str, Any], hint: dict[str, Any]) -> l
     if widget == "combo":
         return [str(o) for o in scalar_enum(hint.get("options"))[:20]]
     return []
+
+
+def schema_for_widget(widget: str, schema: dict[str, Any]) -> dict[str, Any] | None:
+    """The nested editors build themselves from the schema, so the form carries it along."""
+    return schema if widget in ("array", "object") else None
 
 
 def fallback_field(key: str, schema: dict[str, Any], required: bool) -> dict[str, Any]:
@@ -408,7 +520,9 @@ def fallback_field(key: str, schema: dict[str, Any], required: bool) -> dict[str
     elif kind == "boolean":
         widget = "checkbox"
     elif kind == "array":
-        widget = "multiselect" if info["item_options"] else "list"
+        widget = "multiselect" if info["item_options"] else "array"
+    elif kind == "object":
+        widget = "object"
     else:
         widget = "json"
     return {
@@ -424,6 +538,7 @@ def fallback_field(key: str, schema: dict[str, Any], required: bool) -> dict[str
         "step": None,
         "default": schema.get("default"),
         "help": short(str(schema.get("description") or ""), 300),
+        "schema": schema_for_widget(widget, schema),
     }
 
 
@@ -443,6 +558,10 @@ def default_fits(spec: dict[str, Any], value: Any) -> bool:
         return isinstance(value, list) and all(v in spec["options"] for v in cast(list[Any], value))
     if widget == "list":
         return isinstance(value, list) and all(isinstance(v, (str, int, float)) for v in cast(list[Any], value))
+    if widget == "array":
+        return isinstance(value, list)
+    if widget == "object":
+        return isinstance(value, dict)
     return True
 
 
@@ -461,7 +580,7 @@ def build_spec(tool: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any
 
     fields: list[dict[str, Any]] = []
     for key, raw_schema in props.items():
-        schema = as_dict(raw_schema)
+        schema = simplify_schema(as_dict(raw_schema), params)
         spec = fallback_field(key, schema, key in required)
         info = describe_schema(schema)
         hint = ai_fields.get(key, {})
@@ -481,6 +600,7 @@ def build_spec(tool: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any
         if isinstance(widget, str) and widget in allowed:
             spec["widget"] = widget
         spec["options"] = widget_options(spec["widget"], info, hint)
+        spec["schema"] = schema_for_widget(spec["widget"], schema)
         if spec["widget"] == "slider" and value_range is not None:
             spec["min"], spec["max"] = value_range
             step = hint.get("step")
@@ -509,17 +629,237 @@ def provisional_controls(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [CONTROLS_CACHE.get(tool_key(t)) or build_spec(t, None) for t in tools]
 
 
-async def ai_controls(tools: list[dict[str, Any]], model: str) -> dict[str, dict[str, Any]]:
+def finished_controls(text: str) -> list[dict[str, Any]]:
+    """The tool objects already complete inside the "controls" array of a reply that may still be arriving."""
+    text = strip_reasoning(text)
+    opening = re.search(r'"controls"\s*:\s*\[', text)
+    if opening is None:
+        return []
+    found: list[dict[str, Any]] = []
+    depth, start = 0, -1
+    in_string = escaped = False
+    for index in range(opening.end(), len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    found.append(as_dict(json.loads(text[start : index + 1])))
+                except ValueError:
+                    pass
+                start = -1
+        elif char == "]" and depth == 0:
+            break
+    return found
+
+
+async def read_tools(tools: list[dict[str, Any]], model: str, on_tool: Callable[[dict[str, Any]], None]) -> None:
+    """Have the AI read `tools`, calling `on_tool` with each tool's hints the moment that tool is complete."""
     trimmed = [{**t, "description": t["description"][:2000]} for t in tools]
-    text = await call_upstream_json(model, CONTROLS_PROMPT, json.dumps({"tools": trimmed}, ensure_ascii=False))
-    parsed = as_dict(extract_json(text))
-    result: dict[str, dict[str, Any]] = {}
-    for item in as_list(parsed.get("controls")):
-        entry = as_dict(item)
-        name = entry.get("name")
-        if isinstance(name, str):
-            result[name] = entry
-    return result
+    delivered: set[str] = set()
+
+    def deliver(entries: list[dict[str, Any]]) -> None:
+        for entry in entries:
+            name = entry.get("name")
+            if isinstance(name, str) and name not in delivered:
+                delivered.add(name)
+                on_tool(entry)
+
+    text = ""
+    async for piece in stream_upstream_text(model, CONTROLS_PROMPT, json.dumps({"tools": trimmed}, ensure_ascii=False)):
+        text += piece
+        if "}" in piece:
+            deliver(finished_controls(text))
+    deliver(finished_controls(text))
+    try:
+        parsed = as_dict(extract_json(text))
+    except ValueError:
+        if not delivered:
+            raise RuntimeError("The AI's reply was not valid JSON") from None
+        return
+    deliver([as_dict(item) for item in as_list(parsed.get("controls"))])
+
+
+# --------------------------------------------------------------------------
+# Recognising a client's own background prompts, and which chat a request belongs to
+# --------------------------------------------------------------------------
+
+
+def load_utility_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    patterns: list[tuple[str, re.Pattern[str]]] = []
+    try:
+        lines = UTILITY_PATTERNS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        log.warning("No patterns file at %s: background prompts will not be recognised", UTILITY_PATTERNS_FILE)
+        return patterns
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        label, separator, expression = line.partition(" :: ")
+        if not separator:
+            label, expression = "background task", line
+        try:
+            patterns.append((label.strip(), re.compile(expression.strip(), re.IGNORECASE)))
+        except re.error as exc:
+            log.warning("%s line %d skipped, bad pattern: %s", UTILITY_PATTERNS_FILE.name, number, exc)
+    return patterns
+
+
+UTILITY_PATTERNS = load_utility_patterns()
+
+
+def last_user_text(body: dict[str, Any]) -> str:
+    for item in reversed(as_list(body.get("messages"))):
+        message = as_dict(item)
+        if message.get("role") == "user":
+            return content_text(message.get("content"))
+    return ""
+
+
+def utility_kind(body: dict[str, Any]) -> str:
+    """The label of the matching background-task pattern (e.g. "tags"), or "" for a normal request."""
+    text = last_user_text(body)[:UTILITY_SCAN_CHARS]
+    for label, pattern in UTILITY_PATTERNS:
+        if pattern.search(text):
+            return label
+    return ""
+
+
+Key = tuple[str, str]  # (role, text with whitespace collapsed)
+WRAP_MARGIN = 40  # how much text a client must have added around a message for us to call it "wrapped"
+
+
+def conversation_keys(body: dict[str, Any]) -> list[Key]:
+    """The conversation as comparable keys: user and tool messages only.
+
+    System prompts are skipped because clients change them between turns, and so are assistant messages
+    because clients rewrite them (reasoning blocks, citations, ...). What the user and the tools said is
+    what identifies a chat.
+    """
+    keys: list[Key] = []
+    for item in as_list(body.get("messages")):
+        message = as_dict(item)
+        role = str(message.get("role", ""))
+        if role in ("user", "tool"):
+            keys.append((role, " ".join(content_text(message.get("content")).split())))
+    return keys
+
+
+FUZZY_RATIO = 0.93  # how alike two messages must be to count as "the same, slightly edited"
+FUZZY_MIN_CHARS = 20
+FUZZY_SAMPLE = 1500
+EXTEND_MIN_CHARS = 12
+
+
+def texts_close(a: str, b: str) -> bool:
+    """Equal, or so alike that a client's small edit (a date, a trailing note) explains the difference."""
+    if a == b:
+        return True
+    longest = max(len(a), len(b))
+    if min(len(a), len(b)) < FUZZY_MIN_CHARS or abs(len(a) - len(b)) > longest * 0.1:
+        return False
+    if longest > FUZZY_SAMPLE * 2:
+        a, b = a[:FUZZY_SAMPLE] + a[-FUZZY_SAMPLE:], b[:FUZZY_SAMPLE] + b[-FUZZY_SAMPLE:]
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    return matcher.quick_ratio() >= FUZZY_RATIO and matcher.ratio() >= FUZZY_RATIO
+
+
+def key_close(old: Key, new: Key) -> bool:
+    return old[0] == new[0] and texts_close(old[1], new[1])
+
+
+def wrapped(old: Key, new: Key) -> bool:
+    """`old` is `new` with a lot of text around it, e.g. a client's retrieval template around the question."""
+    return old[0] == new[0] and len(new[1]) >= 4 and new[1] in old[1] and len(old[1]) - len(new[1]) >= WRAP_MARGIN
+
+
+def extends(old: Key, new: Key) -> bool:
+    """`new` starts with all of `old` and goes on: a client that keeps the whole transcript inside one message."""
+    return old[0] == new[0] and len(old[1]) >= EXTEND_MIN_CHARS and len(new[1]) > len(old[1]) and new[1].startswith(old[1])
+
+
+def prefix_close(old: list[Key], new: list[Key]) -> bool:
+    return all(key_close(o, n) for o, n in zip(old, new))
+
+
+def continues(old: list[Key], new: list[Key]) -> bool:
+    """Whether `new` is `old` plus later messages, the way a client resends a chat's history."""
+    n = len(old)
+    if n == 0 or not new:
+        return False
+    if len(new) < n:
+        return prefix_close(old, new)  # the client rewound the chat and resent the start of it
+    for offset in range(n):
+        overlap = n - offset
+        if offset:
+            if overlap < 2:
+                break  # too little in common to trust once the client has dropped old messages
+            if len(new) <= overlap or not key_close(old[offset], new[0]):
+                continue
+        if not prefix_close(old[offset : n - 1], new[: overlap - 1]):
+            continue
+        last_old, last_new = old[n - 1], new[overlap - 1]
+        # The newest message of `old` may since have been edited, lost the text the client wrapped around it,
+        # or grown into a transcript of everything said since.
+        if key_close(last_old, last_new) or extends(last_old, last_new):
+            return True
+        if len(new) > overlap and wrapped(last_old, last_new):
+            return True
+    return False
+
+
+def compare_keys(old: list[Key], new: list[Key], limit: int = 12) -> list[dict[str, Any]]:
+    """Side-by-side rows saying where two chats agree, for the "why is this a separate chat?" panel."""
+    rows: list[dict[str, Any]] = []
+    for index in range(min(max(len(old), len(new)), limit)):
+        before = old[index] if index < len(old) else None
+        after = new[index] if index < len(new) else None
+        if before is None:
+            state = "only-new"
+        elif after is None:
+            state = "only-old"
+        elif before == after:
+            state = "same"
+        elif key_close(before, after):
+            state = "close"
+        else:
+            state = "differs"
+        rows.append(
+            {
+                "index": index + 1,
+                "state": state,
+                "old": f"{before[0]}: {short(before[1], 90)}" if before else "",
+                "new": f"{after[0]}: {short(after[1], 90)}" if after else "",
+            }
+        )
+    return rows
+
+
+def conversation_hint(request: Request, body: dict[str, Any]) -> str:
+    """A chat id the client sent explicitly (header or body field), which beats guessing from the history."""
+    for name in CHAT_ID_HEADERS:
+        value = request.headers.get(name, "").strip()
+        if value:
+            return value[:100]
+    for name in CHAT_ID_FIELDS:
+        value = body.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:100]
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -557,10 +897,123 @@ class PendingRequest:
     controls_version: int = 0
     controls: list[dict[str, Any]] = field(default_factory=lambda: [])
     controls_task: asyncio.Task[None] | None = None
+    conversation: str = ""  # requests that continue one another share this
+    turn: int = 1
+    auto: bool = False  # a client background task, answered by the AI without asking
+    kind: str = ""  # which background task (title, tags, ...)
+    keys: list[Key] = field(default_factory=lambda: [])
+    note: str = ""  # why this request did not join a chat it nearly matched
+    hint: str = ""  # chat id the client sent, if any
+    clear_scheduled: bool = False
+    controls_done: int = 0  # tools read so far
+    controls_total: int = 0
 
 
 REQUESTS: dict[str, PendingRequest] = {}
 ACTIVE_STATUSES = ("pending", "forwarding")
+
+
+@dataclass
+class ChatMemory:
+    """What we remember of a chat after its requests were cleared, so it can still be continued."""
+
+    conversation: str
+    keys: list[Key]
+    turn: int
+    stamp: float
+
+
+CHAT_MEMORY: dict[str, ChatMemory] = {}
+HINTS: dict[str, str] = {}  # chat id a client sent -> the conversation it belongs to
+
+
+def remember(pr: PendingRequest) -> None:
+    if pr.auto or not pr.keys:
+        return
+    CHAT_MEMORY.pop(pr.conversation, None)  # re-insert so the dict stays ordered oldest first
+    CHAT_MEMORY[pr.conversation] = ChatMemory(pr.conversation, pr.keys, pr.turn, pr.created)
+    while len(CHAT_MEMORY) > CHAT_MEMORY_LIMIT:
+        CHAT_MEMORY.pop(next(iter(CHAT_MEMORY)))
+
+
+def chat_candidates() -> list[ChatMemory]:
+    found = list(CHAT_MEMORY.values())
+    found.extend(ChatMemory(pr.conversation, pr.keys, pr.turn, pr.created) for pr in REQUESTS.values() if not pr.auto and pr.keys)
+    return found
+
+
+def latest_turn(conversation: str) -> int:
+    turns = [pr.turn for pr in REQUESTS.values() if pr.conversation == conversation]
+    remembered = CHAT_MEMORY.get(conversation)
+    return max(turns + ([remembered.turn] if remembered else []), default=0)
+
+
+def find_continued(keys: list[Key]) -> ChatMemory | None:
+    """The earlier chat state this request continues, preferring the one with the most in common."""
+    best: ChatMemory | None = None
+    for candidate in chat_candidates():
+        if continues(candidate.keys, keys) and (
+            best is None or (len(candidate.keys), candidate.stamp) > (len(best.keys), best.stamp)
+        ):
+            best = candidate
+    return best
+
+
+def explain_no_match(keys: list[Key]) -> str:
+    """For a request that joined no chat: the earlier chat it almost matched, and where they differ."""
+    best_common, best_old = 0, None
+    for candidate in chat_candidates():
+        common = 0
+        for old_key, new_key in zip(candidate.keys, keys):
+            if not key_close(old_key, new_key):
+                break
+            common += 1
+        if common > best_common and common < len(candidate.keys) and common < len(keys):
+            best_common, best_old = common, candidate
+    if best_old is None:
+        return ""
+    old_role, old_text = best_old.keys[best_common]
+    new_role, new_text = keys[best_common]
+    return (
+        f"Not joined to an earlier chat that matches up to message {best_common}: "
+        f"it then has {old_role} “{short(old_text, 70)}” but this has {new_role} “{short(new_text, 70)}”"
+    )
+
+
+def match_report(pr: PendingRequest) -> dict[str, Any] | None:
+    """How this request compares with the closest other chat, so a missed merge can be understood."""
+    if pr.auto or not pr.keys:
+        return None
+    others = [c for c in chat_candidates() if c.conversation != pr.conversation]
+    if not others:
+        return None
+    best = max(others, key=lambda c: (sum(1 for o, n in zip(c.keys, pr.keys) if key_close(o, n)), c.stamp))
+    return {
+        "conversation": best.conversation,
+        "turn": best.turn,
+        "old_count": len(best.keys),
+        "new_count": len(pr.keys),
+        "rows": compare_keys(best.keys, pr.keys),
+    }
+
+
+def assign_conversation(keys: list[Key], hint: str) -> tuple[str, int, str]:
+    """(chat id, turn number, note). The note explains a near miss and is empty when there is nothing to say."""
+    if hint:
+        conversation = HINTS.get(hint)
+        if conversation is None:
+            # A chat we followed by its text before the client started sending an id; one that already has its own id is not it.
+            earlier = find_continued(keys)
+            adopt = earlier is not None and earlier.conversation not in HINTS.values()
+            conversation = earlier.conversation if earlier is not None and adopt else secrets.token_hex(4)
+            HINTS[hint] = conversation
+            while len(HINTS) > CHAT_MEMORY_LIMIT * 2:
+                HINTS.pop(next(iter(HINTS)))
+        return conversation, latest_turn(conversation) + 1, ""
+    earlier = find_continued(keys)
+    if earlier is not None:
+        return earlier.conversation, earlier.turn + 1, ""
+    return secrets.token_hex(4), 1, explain_no_match(keys)
 
 
 class Hub:
@@ -595,8 +1048,20 @@ class Hub:
 HUB = Hub()
 
 
+def drop_auto(request_id: str) -> None:
+    pr = REQUESTS.get(request_id)
+    if pr is None or not pr.auto or pr.status in ACTIVE_STATUSES:
+        return
+    del REQUESTS[request_id]
+    HUB.publish({"type": "removed", "ids": [request_id]})
+
+
 def publish_request(pr: PendingRequest) -> None:
     HUB.publish({"type": "request", "request": summarize(pr)})
+    if pr.auto and AUTO_CLEAR_SECONDS > 0 and not pr.clear_scheduled and pr.status not in ACTIVE_STATUSES:
+        pr.clear_scheduled = True  # a finished background task tidies itself away
+        keep = AUTO_CLEAR_SECONDS * (10 if pr.status == "error" else 1)
+        asyncio.get_running_loop().call_later(keep, drop_auto, pr.id)
 
 
 def controls_payload(pr: PendingRequest) -> dict[str, Any]:
@@ -605,6 +1070,8 @@ def controls_payload(pr: PendingRequest) -> dict[str, Any]:
         "version": pr.controls_version,
         "state": pr.controls_state,
         "error": pr.controls_error,
+        "done": pr.controls_done,
+        "total": pr.controls_total,
         "controls": pr.controls,
     }
 
@@ -625,52 +1092,81 @@ def controls_model_for(pr: PendingRequest) -> str:
     return SETTINGS.controls_model or SETTINGS.forward_model or DEFAULT_MODEL
 
 
+def accept_control(
+    pr: PendingRequest,
+    tools: list[dict[str, Any]],
+    wanted: set[str],
+    accepted: set[str],
+    entry: dict[str, Any],
+) -> None:
+    """Take one tool's hints from the AI the moment they are complete: cache them and show the progress."""
+    name = entry.get("name")
+    if not isinstance(name, str) or name not in wanted or name in accepted:
+        return
+    tool = next(t for t in tools if t["name"] == name)
+    CONTROLS_CACHE[tool_key(tool)] = build_spec(tool, entry)
+    accepted.add(name)
+    pr.controls_done += 1
+    pr.controls = provisional_controls(tools)
+    bump_controls(pr)
+
+
 async def prepare_controls(pr: PendingRequest, force: bool = False) -> None:
     tools = normalize_tools(pr.body)
     errors: list[str] = []
     try:
         async with CONTROLS_LOCK:
             todo = [t for t in tools if force or tool_key(t) not in CONTROLS_CACHE]
-            changed = False
+            pr.controls_total = len(tools)
+            pr.controls_done = len(tools) - len(todo)
+            bump_controls(pr)
             for start in range(0, len(todo), CONTROLS_BATCH):
                 batch = todo[start : start + CONTROLS_BATCH]
+                wanted = {t["name"] for t in batch}
+                accepted: set[str] = set()
+                failed = False
                 try:
-                    ai = await ai_controls(batch, controls_model_for(pr))
+                    await read_tools(
+                        batch,
+                        controls_model_for(pr),
+                        lambda entry: accept_control(pr, tools, wanted, accepted, entry),
+                    )
                 except Exception as exc:  # noqa: BLE001 - any failure falls back to schema controls
+                    failed = True
                     errors.append(describe_exception(exc))
-                    continue
+                if accepted:
+                    save_cache()
                 for tool in batch:
-                    hint = ai.get(tool["name"])
-                    if hint is None:
-                        errors.append(f"the AI left out {tool['name']}")
-                        continue
-                    CONTROLS_CACHE[tool_key(tool)] = build_spec(tool, hint)
-                    changed = True
+                    if tool["name"] not in accepted:
+                        if not failed:
+                            errors.append(f"the AI left out {tool['name']}")
+                        pr.controls_done += 1  # nothing more will come for it; the schema form stands in
                 pr.controls = provisional_controls(tools)
                 bump_controls(pr)
-            if changed:
-                save_cache()
     except Exception as exc:  # noqa: BLE001
         errors.append(describe_exception(exc))
     pr.controls = provisional_controls(tools)
+    pr.controls_done = pr.controls_total
     pr.controls_error = short("; ".join(dict.fromkeys(errors)), 400)
     pr.controls_state = "ready"
     bump_controls(pr)
 
 
 def prune() -> None:
-    excess = len(REQUESTS) - MAX_HISTORY
-    if excess <= 0:
-        return
+    """Keep history bounded. Background tasks have their own budget so they never push real chats out."""
     finished = [rid for rid, pr in REQUESTS.items() if pr.status not in ACTIVE_STATUSES]
-    removed = finished[:excess]
+    auto_total = sum(1 for pr in REQUESTS.values() if pr.auto)
+    regular_total = len(REQUESTS) - auto_total
+    auto_ids = [rid for rid in finished if REQUESTS[rid].auto]
+    regular_ids = [rid for rid in finished if not REQUESTS[rid].auto]
+    removed = auto_ids[: max(0, auto_total - AUTO_HISTORY)] + regular_ids[: max(0, regular_total - MAX_HISTORY)]
     for rid in removed:
         del REQUESTS[rid]
     if removed:
         HUB.publish({"type": "removed", "ids": removed})
 
 
-def create_request(body: dict[str, Any], generate_controls: bool) -> PendingRequest:
+def create_request(body: dict[str, Any], generate_controls: bool, hint: str = "", kind: str = "") -> PendingRequest:
     pr = PendingRequest(
         id=secrets.token_hex(4),
         created=time.time(),
@@ -678,9 +1174,22 @@ def create_request(body: dict[str, Any], generate_controls: bool) -> PendingRequ
         stream=bool(body.get("stream")),
         future=asyncio.get_running_loop().create_future(),
     )
+    pr.kind = kind
+    pr.auto = bool(kind)
+    if pr.auto:
+        pr.conversation = secrets.token_hex(4)
+    else:
+        pr.keys = conversation_keys(body)
+        pr.conversation, pr.turn, pr.note = assign_conversation(pr.keys, hint)
+        remember(pr)
+        if pr.note:
+            log.info("request %s: %s", pr.id, pr.note)
+    pr.hint = hint
     tools = normalize_tools(body)
     pr.controls = provisional_controls(tools)
-    missing = any(tool_key(t) not in CONTROLS_CACHE for t in tools)
+    missing = [t for t in tools if tool_key(t) not in CONTROLS_CACHE]
+    pr.controls_total = len(tools)
+    pr.controls_done = len(tools) - len(missing)
     if missing and generate_controls:
         pr.controls_state = "working"
         pr.controls_task = asyncio.create_task(prepare_controls(pr))
@@ -688,12 +1197,16 @@ def create_request(body: dict[str, Any], generate_controls: bool) -> PendingRequ
     prune()
     publish_request(pr)
     log.info(
-        "request %s: model=%s messages=%d tools=%d stream=%s",
+        "request %s: model=%s messages=%d tools=%d stream=%s chat=%s turn=%d shape=[%s]%s",
         pr.id,
         body.get("model"),
         len(as_list(body.get("messages"))),
         len(tools),
         pr.stream,
+        pr.conversation,
+        pr.turn,
+        " ".join(f"{role[0]}{len(text)}" for role, text in pr.keys),
+        f" background={pr.kind}" if pr.auto else "",
     )
     return pr
 
@@ -999,7 +1512,7 @@ async def list_models(request: Request) -> Response:
 
 async def wait_for_decision(request: Request, pr: PendingRequest) -> Decision | None:
     while not pr.future.done():
-        await asyncio.wait({pr.future}, timeout=1.0)
+        await asyncio.wait({pr.future}, timeout=0.5)
         if not pr.future.done() and await request.is_disconnected():
             return None
     return pr.future.result()
@@ -1025,7 +1538,7 @@ async def stream_flow(request: Request, pr: PendingRequest) -> AsyncIterator[str
     try:
         last_ping = time.monotonic()
         while not pr.future.done():
-            await asyncio.wait({pr.future}, timeout=1.0)
+            await asyncio.wait({pr.future}, timeout=0.5)
             if pr.future.done():
                 break
             if await request.is_disconnected():
@@ -1062,8 +1575,9 @@ async def chat_completions(request: Request) -> Response:
         return error_response(400, "Request body must be an object with a 'messages' array")
     payload = cast(dict[str, Any], body)
 
-    auto = SETTINGS.auto_forward
-    pr = create_request(payload, generate_controls=not auto)
+    kind = utility_kind(payload) if SETTINGS.auto_utility else ""
+    auto = SETTINGS.auto_forward or bool(kind)  # either way the AI answers without asking the operator
+    pr = create_request(payload, generate_controls=not auto, hint=conversation_hint(request, payload), kind=kind)
     if auto:
         resolve(pr, Decision("forward"))
 
@@ -1119,8 +1633,17 @@ def summarize(pr: PendingRequest) -> dict[str, Any]:
             text = message["text"] or f"{message['tool_calls'][0]['name']}(…)"
             preview = f"{message['role']}: {short(text, 140)}"
             break
+    if pr.auto:
+        reply = str((pr.answer or {}).get("content") or "")
+        preview = f"{pr.kind}: {short(reply, 120)}" if reply else pr.kind
     return {
         "id": pr.id,
+        "conversation": pr.conversation,
+        "turn": pr.turn,
+        "auto": pr.auto,
+        "kind": pr.kind,
+        "note": pr.note,
+        "chat_id": pr.hint,
         "created": pr.created,
         "status": pr.status,
         "model": str(pr.body.get("model") or ""),
@@ -1157,6 +1680,7 @@ async def api_get_request(request_id: str) -> dict[str, Any]:
         "messages": messages_view(pr.body),
         "tool_names": [t["name"] for t in normalize_tools(pr.body)],
         "params": params,
+        "match": match_report(pr) if pr.turn == 1 else None,
     }
 
 
@@ -1173,9 +1697,44 @@ async def api_regenerate_controls(request_id: str) -> dict[str, str]:
         raise HTTPException(409, "Controls are already being generated")
     pr.controls_state = "working"
     pr.controls_error = ""
+    pr.controls_total = len(normalize_tools(pr.body))
+    pr.controls_done = 0
     bump_controls(pr)
     pr.controls_task = asyncio.create_task(prepare_controls(pr, force=True))
     return {"state": pr.controls_state}
+
+
+class JoinIn(BaseModel):
+    conversation: str
+
+
+@app.post("/api/requests/{request_id}/join")
+async def api_join(request_id: str, payload: JoinIn) -> dict[str, Any]:
+    """Merge this request's chat into another one by hand, when automatic matching could not tell they belong together."""
+    pr = get_request(request_id)
+    if pr.auto:
+        raise HTTPException(422, "Background tasks are not part of a chat")
+    target, source = payload.conversation, pr.conversation
+    if target == source:
+        return {"conversation": target}
+    if target not in CHAT_MEMORY and not any(r.conversation == target and not r.auto for r in REQUESTS.values()):
+        raise HTTPException(404, "That chat no longer exists")
+    turn = latest_turn(target)
+    moved = sorted((r for r in REQUESTS.values() if r.conversation == source and not r.auto), key=lambda r: r.created)
+    for item in moved:
+        turn += 1
+        item.conversation, item.turn, item.note = target, turn, ""
+    CHAT_MEMORY.pop(source, None)
+    for hint, conversation in list(HINTS.items()):
+        if conversation == source:
+            HINTS[hint] = target
+    members = [r for r in REQUESTS.values() if r.conversation == target and not r.auto]
+    if members:
+        remember(max(members, key=lambda r: r.created))
+    for item in moved:
+        publish_request(item)
+    log.info("request %s: chat %s merged into %s by hand", pr.id, source, target)
+    return {"conversation": target, "turn": pr.turn}
 
 
 class ToolCallIn(BaseModel):
@@ -1236,6 +1795,7 @@ class SettingsIn(BaseModel):
     forward_model: str | None = None
     controls_model: str | None = None
     auto_forward: bool | None = None
+    auto_utility: bool | None = None
 
 
 def settings_view() -> dict[str, Any]:
@@ -1245,6 +1805,7 @@ def settings_view() -> dict[str, Any]:
         "forward_model": SETTINGS.forward_model,
         "controls_model": SETTINGS.controls_model,
         "auto_forward": SETTINGS.auto_forward,
+        "auto_utility": SETTINGS.auto_utility,
         "client_api_key_required": bool(API_KEY),
     }
 
@@ -1262,6 +1823,8 @@ async def api_set_settings(payload: SettingsIn) -> dict[str, Any]:
         SETTINGS.controls_model = payload.controls_model.strip()
     if payload.auto_forward is not None:
         SETTINGS.auto_forward = payload.auto_forward
+    if payload.auto_utility is not None:
+        SETTINGS.auto_utility = payload.auto_utility
     save_settings()
     HUB.publish({"type": "settings", "settings": settings_view()})
     return settings_view()
